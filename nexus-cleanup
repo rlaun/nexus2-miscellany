@@ -1,0 +1,133 @@
+#!/usr/bin/env python2.7
+
+from __future__ import print_function
+
+import getopt
+import requests
+import sys
+import xml.etree.ElementTree as ET
+
+
+usage='''
+Usage:
+   nexus-cleanup [-l <limit>] [-n] [--user <user>] [--pass <pass>] [--url <url>] [--id <repository id>]
+
+Options:
+   -l <limit>    Keep the specified number of releases per artifact. (Default: 2)
+   -n            Use .netrc for authentication. (Default: false)
+   --user        Nexus username. Ignored if -n is set. (Default: admin)
+   --pass        Nexus password. Ignored if -n is set. (Default: admin123)
+   --url         Nexus base URL. (Default: http://localhost:8081/nexus)
+   --id          The repository's id. (Default: releases)
+   --dry-run     Do not delete anything from the repository; just print the deletion candidates.
+'''
+
+NX_URL = 'http://localhost:8081/nexus'
+REPO_ID = 'releases'
+
+# number of releases to keep
+KEEP=2
+
+# default to the Nexus defaults
+USER='admin'
+PASS='admin123'
+use_netrc = False
+dry_run = False
+auth=None
+
+try:
+    opts, args = getopt.getopt(sys.argv[1:], 'hnl:', ['help', 'user=', 'pass=', 'id=', 'url=', 'dry-run'])
+except getopt.GetoptError as err:
+        print(err)
+        print('Try --help')
+        sys.exit(1)
+
+for o, a in opts:
+    if o in ('-h', '--help'):
+        print(usage)
+        exit(0)
+    elif o == '-l':
+        KEEP = int(a)
+    elif o == '-n':
+        use_netrc = True
+    elif o == '--url':
+        NX_URL = a
+    elif o == '--id':
+        REPO_ID = a
+    elif o == '--user':
+        USER = a
+    elif o == '--pass':
+        PASS = a
+    elif o == '--dry-run':
+        dry_run = True
+    else:
+        print('unknown option')
+        print(usage)
+        exit(1)
+
+if not use_netrc:
+    auth = (USER, PASS)
+
+NX_CONTENT = NX_URL + '/service/local/repositories/' + REPO_ID + '/content/'
+
+
+print('Deleting all releases but the last', KEEP, 'from', NX_URL, 'repository', REPO_ID)
+# print('user:', USER)
+# print('pass:', PASS)
+
+def get(url):
+    # print 'GET', url
+    try:
+        res = requests.get(url)
+    except requests.ConnectionError as err:
+        print("Error: Could not connect to", url)
+        print(type(err))
+        sys.exit(1)
+    
+    if res.status_code != 200:
+        print('error: http status', res.status_code)
+        exit(1)
+    return res.text
+
+
+def nx_content_list(uri):
+    result = []
+    xml = get(NX_CONTENT + uri)
+    root = ET.fromstring(xml)
+    for node in root.findall('./data/content-item'):
+        is_leaf = node.find('leaf').text == 'true'
+        filename = node.find('text').text
+        if is_leaf:
+            if filename == 'maven-metadata.xml':
+                # print(uri)
+                xml = get(NX_CONTENT + uri + 'maven-metadata.xml')
+                metadata = ET.fromstring(xml)
+                versions_element = metadata.find('*/versions')
+                versions = versions_element.findall('version')
+                groupId = metadata.find('groupId')
+                artifactId = metadata.find('artifactId')
+                result.append({'path':uri, 'groupId':groupId.text, 'artifactId':artifactId.text, 'versions':list(map(lambda x: x.text, versions))})
+        else:
+            result += nx_content_list(uri + filename + '/')
+    return result
+
+
+artifacts = nx_content_list('')
+
+for a in artifacts:
+    print('Artifact: ', a['groupId'] + ':' + a['artifactId'])
+    c_versions = len(a['versions'])
+    if c_versions > KEEP:
+        delete_versions = a['versions'][0:c_versions - KEEP]
+        for dv in delete_versions:
+            del_path = a['path'] + dv
+            if dry_run:
+                print('Would delete:', del_path)    
+                continue
+
+            print('  Deleting', del_path, end='')
+            res = requests.delete(NX_CONTENT + del_path, auth=auth)
+            if res.status_code != 204:
+                print('Error: http status', res.status_code)
+                exit(1)
+            print('  ... OK [%s]' % res.status_code)
